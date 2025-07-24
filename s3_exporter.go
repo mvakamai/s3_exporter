@@ -90,18 +90,35 @@ func (e *Exporter) Describe(ch chan<- *prometheus.Desc) {
 
 // Collect metrics
 func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
-	var lastModified time.Time
-	var numberOfObjects float64
-	var totalSize int64
-	var biggestObjectSize int64
-	var lastObjectSize int64
-	var commonPrefixes int
+    // Try HEAD request first
+    bytesUsed, objCount, err := getBucketUsageHEAD(e.svc, e.bucket)
+    if err == nil {
+        // HEAD method succeeded, use those values
+        ch <- prometheus.MustNewConstMetric(
+            s3ListSuccess, prometheus.GaugeValue, 1, e.bucket, e.prefix, e.delimiter,
+        )
+        ch <- prometheus.MustNewConstMetric(
+            s3ObjectTotal, prometheus.GaugeValue, objCount, e.bucket, e.prefix,
+        )
+        ch <- prometheus.MustNewConstMetric(
+            s3SumSize, prometheus.GaugeValue, bytesUsed, e.bucket, e.prefix,
+        )
+        return
+    }
 
-	query := &s3.ListObjectsV2Input{
-		Bucket:    aws.String(e.bucket),
-		Prefix:    aws.String(e.prefix),
-		Delimiter: aws.String(e.delimiter),
-	}
+    // fallback to current logic
+    var lastModified time.Time
+    var numberOfObjects float64
+    var totalSize int64
+    var biggestObjectSize int64
+    var lastObjectSize int64
+    var commonPrefixes int
+
+    query := &s3.ListObjectsV2Input{
+        Bucket:    aws.String(e.bucket),
+        Prefix:    aws.String(e.prefix),
+        Delimiter: aws.String(e.delimiter),
+    }
 
 	// Continue making requests until we've listed and compared the date of every object
 	startList := time.Now()
@@ -299,3 +316,57 @@ func main() {
 	}
 	log.Fatal(srv.ListenAndServe())
 }
+
+// getBucketUsageHEAD attempts to query the bucket usage using a Ceph-specific HEAD request to the bucket root.
+// Ceph returns usage information in the headers (x-rgw-*).
+func getBucketUsageHEAD(svc s3iface.S3API, bucket string) (float64, float64, error) {
+	// Create a custom HEAD request
+	r := request.New(aws.NewConfig(), metadata.ClientInfo{}, handlers.Handlers{}, nil, nil)
+	r.Operation = &request.Operation{
+		Name:       "HeadBucket",
+		HTTPMethod: "HEAD",
+		HTTPPath:   fmt.Sprintf("/%s", bucket),
+	}
+	
+	r.HTTPRequest = &http.Request{
+		Method: "HEAD",
+		URL: &url.URL{
+			Scheme: "https",
+			Host:   svc.Endpoint,
+			Path:   fmt.Sprintf("/%s", bucket),
+		},
+		Header: make(http.Header),
+	}
+
+	// Send the request manually
+	err := r.Send()
+	if err != nil {
+		return 0, 0, fmt.Errorf("failed to send HEAD request: %w", err)
+	}
+
+	headers := r.HTTPResponse.Header
+	bytesStr := headers.Get("x-rgw-bytes-used")
+	objsStr := headers.Get("x-rgw-objects-count")
+	if bytesStr == "" || objsStr == "" {
+		return 0, 0, fmt.Errorf("Ceph headers not present in response")
+	}
+
+	bytesUsed, err := strconv.ParseFloat(strings.TrimSpace(bytesStr), 64)
+	if err != nil {
+		return 0, 0, fmt.Errorf("failed to parse bytes-used: %w", err)
+	}
+	objCount, err := strconv.ParseFloat(strings.TrimSpace(objsStr), 64)
+	if err != nil {
+		return 0, 0, fmt.Errorf("failed to parse objects-count: %w", err)
+	}
+
+	return bytesUsed, objCount, nil
+}
+
+// NOTE: call this in (*Exporter).Collect() before falling back to ListObjects
+// bytesUsed, objCount, err := getBucketUsageHEAD(e.svc, e.bucket)
+// if err == nil {
+// 	ch <- prometheus.MustNewConstMetric(s3ObjectTotal, prometheus.GaugeValue, objCount, e.bucket, e.prefix)
+// 	ch <- prometheus.MustNewConstMetric(s3SumSize, prometheus.GaugeValue, bytesUsed, e.bucket, e.prefix)
+// 	return
+// }

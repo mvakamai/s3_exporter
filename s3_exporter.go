@@ -220,7 +220,9 @@ func discoveryHandler(w http.ResponseWriter, r *http.Request, svc s3iface.S3API)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	w.Write(data)
+	if _, err := w.Write(data); err != nil {
+		log.Printf("failed to write JSON response: %v", err)
+	}
 }
 
 func init() {
@@ -273,17 +275,27 @@ func main() {
 		discoveryHandler(w, r, svc)
 	})
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(`<html>
-						 <head><title>AWS S3 Exporter</title></head>
-						 <body>
-						 <h1>AWS S3 Exporter</h1>
-						 <p><a href="` + *probePath + `?bucket=BUCKET&prefix=PREFIX">Query metrics for objects in BUCKET that match PREFIX</a></p>
-						 <p><a href='` + *metricsPath + `'>Metrics</a></p>
-						 <p><a href='` + *discoveryPath + `'>Service Discovery</a></p>
-						 </body>
-						 </html>`))
+		_, err := w.Write([]byte(`<html>
+			<head><title>AWS S3 Exporter</title></head>
+			<body>
+			<h1>AWS S3 Exporter</h1>
+			<p><a href="` + *probePath + `?bucket=BUCKET&prefix=PREFIX">Query metrics for objects in BUCKET that match PREFIX</a></p>
+			<p><a href='` + *metricsPath + `'>Metrics</a></p>
+			<p><a href='` + *discoveryPath + `'>Service Discovery</a></p>
+			</body>
+			</html>`))
+		if err != nil {
+			log.Printf("failed to write response: %v", err)
+		}
 	})
 
 	log.Infoln("Listening on", *listenAddress)
-	log.Fatal(http.ListenAndServe(*listenAddress, nil))
+	srv := &http.Server{
+		Addr:         *listenAddress,
+		Handler:      nil,
+		ReadTimeout:  10 * time.Second,
+		WriteTimeout: 10 * time.Second,
+		IdleTimeout:  60 * time.Second,
+	}
+	log.Fatal(srv.ListenAndServe())
 }
